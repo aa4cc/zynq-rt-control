@@ -23,7 +23,11 @@
 
   The peripherals VHDL sources can be found in the repository
 
-    http://rtime.felk.cvut.cz/gitweb/fpga/zynq/canbench-sw.git/tree/refs/heads/microzed_apo:/system/ip
+    https://gitlab.fel.cvut.cz/canbus/zynq/zynq-can-sja1000-top/tree/master/system/ip
+
+  MZ_APO hardware and mechanical design sources
+
+    https://gitlab.com/pikron/projects/mz_apo/microzed_apo
 
 */
 

@@ -22,7 +22,7 @@
  * although.
  *
  * Linux ERT code is available from
- *    http://rtime.felk.cvut.cz/gitweb/ert_linux.git
+ *    https://github.com/aa4cc/ert_linux
  * More CTU Linux target for Simulink components are available at
  *    http://lintarget.sourceforge.net/
  *
