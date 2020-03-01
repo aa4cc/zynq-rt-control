@@ -115,13 +115,21 @@ mem_address_map_t *mem_address_map_create(off_t region_base, size_t region_size,
 	return memadrs;
 }
 
+static inline
+void mem_address_unmap_and_free(mem_address_map_t *memadrs)
+{
+	if (memadrs == NULL)
+	    return;
+	munmap(memadrs->regs_base_virt, memadrs->region_size);
+	memadrs->regs_base_virt = NULL;
+	free(memadrs);
+}
 
 static inline
 uint32_t mem_address_reg_rd(mem_address_map_t *memadrs, unsigned reg_offs)
 {
 	return *(volatile uint32_t*)((char*)memadrs->regs_base_virt + reg_offs);
 }
-
 
 static inline
 void mem_address_reg_wr(mem_address_map_t *memadrs, unsigned reg_offs, uint32_t val)
