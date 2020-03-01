@@ -1,8 +1,8 @@
 /*
- * S-function to support DC Driver Board FPGA Peripheral
+ * S-function to Read Knob Value from MZ_APO Dial Inputs
  *
  * Copyright (C) 2020 Lukas Cerny <cernylu6@fel.cvut.cz>
- * Copyright (C) 2015-2017 Pavel Pisa <pisa@cmp.felk.cvut.cz>
+ * Copyright (C) 2014-2020 Pavel Pisa <pisa@cmp.felk.cvut.cz>
  *
  * Department of Control Engineering
  * Faculty of Electrical Engineering
@@ -26,8 +26,8 @@
  * for Computer Architectures course
  *   https://cw.fel.cvut.cz/wiki/courses/b35apo/documentation/mz_apo/start
  * The VHDL sources of SPI connected LEDs and knobs peripheral
- *   https://gitlab.fel.cvut.cz/canbus/zynq/zynq-can-sja1000-top/tree/master/system/ip/dcsimpledrv_1.0/hdl
- *
+ *   https://gitlab.fel.cvut.cz/canbus/zynq/zynq-can-sja1000-top/tree/master/system/ip/spi_leds_and_enc_1.0/hdl
+ * 
  * Linux ERT code is available from
  *    https://github.com/aa4cc/ert_linux
  * More CTU Linux target for Simulink components are available at
@@ -38,48 +38,44 @@
  */
 
 
-#define S_FUNCTION_NAME  sfDCMotorOnZynq
+#define S_FUNCTION_NAME  sfAPOKnobInput
 #define S_FUNCTION_LEVEL 2
 
 /*
  * The S-function has next parameters
  *
  * Sample time     - sample time value or -1 for inherited
- * Counter Mode    -
- * Counter Gating
- * Reset Control
- * Digital Filter
+ * Channel         - knob 0 to 2
+ * Initial Value
  */
 
 #define PRM_TS(S)               (mxGetScalar(ssGetSFcnParam(S, 0)))
-#define PRM_MOT_ID(S)           (mxGetScalar(ssGetSFcnParam(S, 1)))
+#define PRM_CHANNEL(S)          (mxGetScalar(ssGetSFcnParam(S, 1)))
+#define PRM_INITIAL_VALUE(S)    (mxGetScalar(ssGetSFcnParam(S, 2)))
 
-#define PRM_COUNT                   2
+#define PRM_COUNT                   3
 
+#define PWORK_IDX_KNOBMEM_STATE     0
 
-#define PWORK_IDX_ZYNQDCMOTMEM_STATE       0
-#define PWORK_IDX_ZYNQDCMOTPOS_STATE       1
+#define PWORK_COUNT                 1
 
-#define PWORK_COUNT                 2
+#define PWORK_KNOBMEM_STATE(S)     (ssGetPWork(S)[PWORK_IDX_KNOBMEM_STATE])
 
-#define PWORK_ZYNQDCMOTMEM_STATE(S)        (ssGetPWork(S)[PWORK_IDX_ZYNQDCMOTMEM_STATE])
-#define PWORK_ZYNQDCMOTPOS_STATE(S)        (ssGetPWork(S)[PWORK_IDX_ZYNQDCMOTPOS_STATE])
+#define IWORK_IDX_CHANNEL           0
+#define IWORK_IDX_VALUE_RAW         1
+#define IWORK_IDX_VALUE_OFFS        2
 
-enum {
-    sIn_N_MOT_PWM = 0,  /* PWM value from interval [-1, 1], dimensions: [1 x 1]  */
-    sIn_N_NUM
-};
+#define IWORK_COUNT                 3
 
-/* Enumerated constants for output ports ******************************************** */
-enum {
-    sOut_N_IRC_POS,       /* IRC position [1 x 1] */
-    sOut_N_NUM
-};
+#define IWORK_CHANNEL(S)            (ssGetIWork(S)[IWORK_IDX_CHANNEL])
+#define IWORK_VALUE_RAW(S)          (ssGetIWork(S)[IWORK_IDX_VALUE_RAW])
+#define IWORK_VALUE_OFFS(S)         (ssGetIWork(S)[IWORK_IDX_VALUE_OFFS])
 
 /*
  * Need to include simstruc.h for the definition of the SimStruct and
  * its associated macro definitions.
  */
+#include <limits.h>
 #include "simstruc.h"
 
 #ifndef WITHOUT_HW
@@ -92,7 +88,6 @@ enum {
 
 #include "mzapo_regs.h"
 #include "phys_address_access.h"
-
 
 #endif /*WITHOUT_HW*/
 
@@ -137,10 +132,10 @@ static void mdlCheckParameters(SimStruct *S)
 {
     if ((PRM_TS(S) < 0) && (PRM_TS(S) != -1))
         ssSetErrorStatus(S, "Ts has to be positive or -1 for automatic step");
-    if ((PRM_MOT_ID(S) < 0) || (PRM_MOT_ID(S) > 1)) {
-        printf("Motor ID parameter: %d\n", PRM_MOT_ID(S));
-        ssSetErrorStatus(S, "Motor ID has to be 0 or 1");
-    }
+    if ((PRM_CHANNEL(S) < 0) || (PRM_CHANNEL(S) > 2))
+        ssSetErrorStatus(S, "valid IRC channel is 0, 1, or 2");
+    if ((PRM_INITIAL_VALUE(S) < INT_MIN) || (PRM_INITIAL_VALUE(S) > INT_MAX))
+        ssSetErrorStatus(S, "initial value has to be in int range");
 }
 #endif /* MDL_CHECK_PARAMETERS */
 
@@ -152,10 +147,13 @@ static void mdlCheckParameters(SimStruct *S)
  */
 static void mdlInitializeSizes(SimStruct *S)
 {
+    int_T nInputPorts  = 0;
+    int_T i;
+
     ssSetNumSFcnParams(S, PRM_COUNT);  /* Number of expected parameters */
     if (ssGetNumSFcnParams(S) != ssGetSFcnParamsCount(S)) {
         /* Return if number of expected != number of actual parameters */
-        ssSetErrorStatus(S, "2-parameters required: Ts, MOT_ID");
+        ssSetErrorStatus(S, "3-parameters requited: Ts, Channel, Initial value");
         return;
     }
 
@@ -167,25 +165,15 @@ static void mdlInitializeSizes(SimStruct *S)
     ssSetNumContStates(S, 0);
     ssSetNumDiscStates(S, 0);
 
-    if (!ssSetNumInputPorts(S, sIn_N_NUM)) return;
+    if (!ssSetNumInputPorts(S, nInputPorts)) return;
 
-    ssSetInputPortWidth(S, sIn_N_MOT_PWM, 1);
-    /* ssSetInputPortDataType(S, sIn_N_MOT_PWM, SS_INT32); */
-
-    /*
-     * Set direct feedthrough flag (1=yes, 0=no).
-     * A port has direct feedthrough if the input is used in either
-     * the mdlOutputs or mdlGetTimeOfNextVarHit functions.
-     * See matlabroot/simulink/src/sfuntmpl_directfeed.txt.
-     */
-
-    if (!ssSetNumOutputPorts(S, sOut_N_NUM)) return;
-    ssSetOutputPortWidth(S, sOut_N_IRC_POS, 1);
-    ssSetOutputPortDataType(S, sOut_N_IRC_POS, SS_INT32);
+    if (!ssSetNumOutputPorts(S, 1)) return;
+    ssSetOutputPortWidth(S, 0, 1);
+    ssSetOutputPortDataType(S, 0, SS_INT32);
 
     ssSetNumSampleTimes(S, 1);
     ssSetNumRWork(S, 0);
-    ssSetNumIWork(S, 0);
+    ssSetNumIWork(S, IWORK_COUNT);
     ssSetNumPWork(S, PWORK_COUNT);
     ssSetNumModes(S, 0);
     ssSetNumNonsampledZCs(S, 0);
@@ -233,23 +221,7 @@ static void mdlInitializeSampleTimes(SimStruct *S)
 static void mdlInitializeConditions(SimStruct *S)
 {
   #ifndef WITHOUT_HW
-    mem_address_map_t *memadrs_dcmot1 = (mem_address_map_t *)PWORK_ZYNQDCMOTMEM_STATE(S);
-    int32_T *irc_pos = (int32_T *)PWORK_ZYNQDCMOTPOS_STATE(S);
-    
-    /* Reset IRC variable */
-    *irc_pos = 0;
-    
-    /* Reset IRC counter (and disable DC motor PWM) */
-	mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_CR_o, DCSPDRV_REG_CR_IRC_RESET_m);
-	
-	/* Set frequency of DC motor PWM to 20 kHz (period is given in multiples of 10 ns) */
-	mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_PERIOD_o, 5000 & DCSPDRV_REG_PERIOD_MASK_m);
-	
-	/* Set DC motor PWM duty cycle to 0 (given in multiples of 10 ns, hence it should be less than 5000) */
-	mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_DUTY_o, 0);
-	
-	/* Enable DC motor PWM */
-	mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_CR_o, DCSPDRV_REG_CR_PWM_ENABLE_m);
+
 
   #endif /*WITHOUT_HW*/
 }
@@ -268,51 +240,42 @@ static void mdlInitializeConditions(SimStruct *S)
 static void mdlStart(SimStruct *S)
 {
   #ifndef WITHOUT_HW
+	int initial_value;
+	int knob_value;
+
+    /* ----- Init PWORK_KNOBMEM_STATE(S) ----- */
+    mem_address_map_t *memadrs_knob;
+    PWORK_KNOBMEM_STATE(S) = NULL;
     
-    /* ----- Init PWORK_ZYNQDCMOTMEM_STATE(S) ----- */
-    mem_address_map_t *memadrs_dcmot1;
-    PWORK_ZYNQDCMOTMEM_STATE(S) = NULL;
-    
-    /* Map physical address of DC motor interface to virtual address */
-    if (PRM_MOT_ID(S) == 0) {
-        memadrs_dcmot1 = mem_address_map_create(DCSPDRV_REG_BASE_PHYS_0, DCSPDRV_REG_SIZE, 0);
-    } else {
-        memadrs_dcmot1 = mem_address_map_create(DCSPDRV_REG_BASE_PHYS_1, DCSPDRV_REG_SIZE, 0);
-    }
+    /* Map physical address of knobs to virtual address */
+    memadrs_knob = mem_address_map_create(SPILED_REG_BASE_PHYS, SPILED_REG_SIZE, 0);
     
     /* Check for errors */
-	if (memadrs_dcmot1 == NULL) {
+	if (memadrs_knob == NULL) {
         ssSetErrorStatus(S, "Error when accessing physical address.");
         return;
 	}
     
-    /* Save memory map structure to PWORK_ZYNQDCMOTMEM_STATE(S) */
-    PWORK_ZYNQDCMOTMEM_STATE(S) = memadrs_dcmot1;
-    
-    /* ----- Init PWORK_ZYNQDCMOTPOS_STATE(S) ----- */
-    int32_T *irc_pos_state;
-    PWORK_ZYNQDCMOTPOS_STATE(S) = NULL;
-    
-    /* Alloc memory for position state */
-    irc_pos_state = malloc(sizeof(*irc_pos_state));
-    
-    /* Check for errors */
-    if (irc_pos_state == NULL) {
-        ssSetErrorStatus(S, "Error when calling malloc.");
-        return;
-    }
-    
-    /* Update position */
-    *irc_pos_state = 0;
-    
-    /* Save position to PWORK_ZYNQDCMOTPOS_STATE(S) */
-    PWORK_ZYNQDCMOTPOS_STATE(S) = irc_pos_state;
+    /* Save memory map structure to PWORK_KNOBMEM_STATE(S) */
+    PWORK_KNOBMEM_STATE(S) = memadrs_knob;
+
+    /* Read actual knobs position value from hardware */
+    knob_value = mem_address_reg_rd(memadrs_knob, SPILED_REG_KNOBS_8BIT_o);
+
+    IWORK_CHANNEL(S) = PRM_CHANNEL(S);
+    initial_value = PRM_INITIAL_VALUE(S);
+
+    knob_value >>= 8 * IWORK_CHANNEL(S);
+
+    IWORK_VALUE_RAW(S) = (int8_t)knob_value;
+    IWORK_VALUE_OFFS(S) = initial_value - knob_value;
 
   #endif /*WITHOUT_HW*/
 
     mdlInitializeConditions(S);
 }
 #endif /*  MDL_START */
+
 
 
 /* Function: mdlOutputs =======================================================
@@ -322,13 +285,12 @@ static void mdlStart(SimStruct *S)
  */
 static void mdlOutputs(SimStruct *S, int_T tid)
 {
-    int32_T *irc_pos_output = ssGetOutputPortSignal(S, sOut_N_IRC_POS);
- 
+    int32_T *y = ssGetOutputPortSignal(S,0);
+
   #ifndef WITHOUT_HW
-    int32_T *irc_pos_state = (int32_T *)PWORK_ZYNQDCMOTPOS_STATE(S);
-    *irc_pos_output = *irc_pos_state;
+    y[0] = IWORK_VALUE_RAW(S) + IWORK_VALUE_OFFS(S);
   #else /*WITHOUT_HW*/
-    *irc_pos_output = 0;
+    y[0] = 0;
   #endif /*WITHOUT_HW*/
 }
 
@@ -345,28 +307,19 @@ static void mdlOutputs(SimStruct *S, int_T tid)
    */
 static void mdlUpdate(SimStruct *S, int_T tid)
 {
-    InputRealPtrsType pwm_input = ssGetInputPortRealSignalPtrs(S, sIn_N_MOT_PWM);
-    
   #ifndef WITHOUT_HW
-    
-    mem_address_map_t *memadrs_dcmot1 = (mem_address_map_t *)PWORK_ZYNQDCMOTMEM_STATE(S);
-    int32_T *irc_pos = (int32_T *)PWORK_ZYNQDCMOTPOS_STATE(S);
-    
-    /* Get IRC position */
-    *irc_pos = mem_address_reg_rd(memadrs_dcmot1, DCSPDRV_REG_IRC_o);
-    
-    /* Set PWM */
-    real_T pwm;
-    pwm = **(pwm_input) * 5000;
-    if (pwm > 5000) pwm = 5000;
-    if (pwm < -5000) pwm = -5000;
-    
-    if (pwm > 0) {
-        mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_DUTY_o, (uint32_t)  pwm | DCSPDRV_REG_DUTY_DIR_A_m);
-    } else {
-        mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_DUTY_o, (uint32_t) -pwm | DCSPDRV_REG_DUTY_DIR_B_m);
-    }
-    
+	int knob_value;
+
+    mem_address_map_t *memadrs_knob = (mem_address_map_t *)PWORK_KNOBMEM_STATE(S);
+
+    /* Read actual knobs position value from hardware */
+    knob_value = mem_address_reg_rd(memadrs_knob, SPILED_REG_KNOBS_8BIT_o);
+
+    knob_value >>= 8 * IWORK_CHANNEL(S);
+    knob_value &= 0xff;
+
+    IWORK_VALUE_RAW(S) += (int8_t)(knob_value - IWORK_VALUE_RAW(S));
+
   #endif /*WITHOUT_HW*/
 }
 #endif /* MDL_UPDATE */
@@ -396,25 +349,11 @@ static void mdlUpdate(SimStruct *S, int_T tid)
 static void mdlTerminate(SimStruct *S)
 {
   #ifndef WITHOUT_HW
+    mem_address_map_t *memadrs_knob = (mem_address_map_t *)PWORK_KNOBMEM_STATE(S);
+
+    mem_address_unmap_and_free(memadrs_knob);
     
-    mem_address_map_t *memadrs_dcmot1 = (mem_address_map_t *)PWORK_ZYNQDCMOTMEM_STATE(S);
-    
-    /* Set PWM to 0 */
-    mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_DUTY_o, 0);
-    
-    /* Disable PWM */
-    mem_address_reg_wr(memadrs_dcmot1, DCSPDRV_REG_CR_o, 0);
-    
-    int32_T *irc_pos = (int32_T *)PWORK_ZYNQDCMOTPOS_STATE(S);
-    if (memadrs_dcmot1 != NULL) {
-        PWORK_ZYNQDCMOTMEM_STATE(S) = NULL;
-        free(memadrs_dcmot1);
-    }
-    
-    if (irc_pos != NULL) {
-        PWORK_ZYNQDCMOTPOS_STATE(S) = NULL;
-        free(irc_pos);
-    }
+    PWORK_KNOBMEM_STATE(S) = NULL;
   #endif /*WITHOUT_HW*/
 }
 
